@@ -246,7 +246,7 @@ class HFLM(TemplateLM):
         else:
             self.batch_size_per_gpu = int(batch_size)
 
-        if isinstance(pretrained, str):
+        if isinstance(pretrained, str) and self.method is None:
             if gpus >= 1 or str(self.device) == "mps":
                 # TODO: can remove this whole snippet except in the mps case, perhaps?
                 if not (parallelize or autogptq or hasattr(self, "accelerator")):
@@ -422,7 +422,7 @@ class HFLM(TemplateLM):
             return self._max_length
         seqlen_config_attrs = ("n_positions", "max_position_embeddings", "n_ctx")
         for attr in seqlen_config_attrs:
-            if hasattr(self.model.config, attr):
+            if hasattr(self.model, 'config') and hasattr(self.model.config, attr):
                 return getattr(self.model.config, attr)
         if hasattr(self.tokenizer, "model_max_length"):
             if self.tokenizer.model_max_length == 1000000000000000019884624838656:
@@ -590,16 +590,31 @@ class HFLM(TemplateLM):
                         model_kwargs["bnb_4bit_compute_dtype"] = get_dtype(
                             model_kwargs["bnb_4bit_compute_dtype"]
                         )
+            
+            if 'method' not in model_kwargs.keys():
+                self.method = None
+            else:
+                self.method = model_kwargs['method']
+            
+            if self.method is None:
+                self._model = self.AUTO_MODEL_CLASS.from_pretrained(
+                    pretrained,
+                    revision=revision,
+                    torch_dtype=get_dtype(dtype),
+                    trust_remote_code=trust_remote_code,
+                    gguf_file=gguf_file,
+                    quantization_config=quantization_config,
+                    **model_kwargs,
+                )
+            else:
+                import sys
+                python_path = model_kwargs['python_path']
+                sys.path.append(python_path)
 
-            self._model = self.AUTO_MODEL_CLASS.from_pretrained(
-                pretrained,
-                revision=revision,
-                torch_dtype=get_dtype(dtype),
-                trust_remote_code=trust_remote_code,
-                gguf_file=gguf_file,
-                quantization_config=quantization_config,
-                **model_kwargs,
-            )
+                from llama import LLM
+
+                thresholds_dir = model_kwargs['thresholds_dir']
+                self._model = LLM(pretrained, thresholds_dir=thresholds_dir, method=self.method)
         else:
             if autogptq and gptqmodel:
                 raise ValueError(
@@ -1370,12 +1385,18 @@ class HFLM(TemplateLM):
                 kwargs["max_length"] = context_enc.shape[1] + max_gen_toks
 
             # perform batched generation
-            cont = self._model_generate(
-                context=context_enc,
-                attention_mask=attn_masks,
-                stop=until,
-                **kwargs,
-            )
+
+            if self.method is None:
+                cont = self._model_generate(
+                    context=context_enc,
+                    attention_mask=attn_masks,
+                    stop=until,
+                    **kwargs,
+                )
+            else:
+                input_ids = context_enc[0].tolist()
+                output_ids = self.model.generate(input_ids=input_ids, max_new_tokens=max_gen_toks)
+                cont = torch.tensor(input_ids + output_ids, device=self.device).unsqueeze(0)
 
             cont_toks_list = cont.tolist()
             for cont_toks, context in zip(cont_toks_list, contexts):
